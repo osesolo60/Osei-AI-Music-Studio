@@ -1,7 +1,9 @@
 package com.osei.aimusicstudio
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
+import androidx.core.content.FileProvider
 import androidx.room.Room
 import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.sqlite.db.SupportSQLiteOpenHelper
@@ -9,6 +11,7 @@ import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
 import com.osei.aimusicstudio.audio.AudioEffectsConfig
 import com.osei.aimusicstudio.audio.AudioEffectsRenderer
+import com.osei.aimusicstudio.audio.AudioShareHelper
 import com.osei.aimusicstudio.audio.MixerTrackMixSpec
 import com.osei.aimusicstudio.audio.MultitrackWavExporter
 import com.osei.aimusicstudio.audio.PcmWavSeekReader
@@ -383,25 +386,144 @@ class Phase5_1VerificationRobolectricTest {
         assertTrue("Active file must NOT be removed", activeRenderTmp.exists())
         activeRenderTmp.delete()
 
-        // Shared exports cleanup
+        // Shared exports cleanup (7-day retention)
         val activeShare = File(shareDir, "active_share.wav").apply {
             writeBytes(ByteArray(64))
-            setLastModified(now - 10_000L)
+            setLastModified(now - 8L * 24L * 60L * 60_000L)
+        }
+        val sixDaysOldShare = File(shareDir, "six_days_share.wav").apply {
+            writeBytes(ByteArray(64))
+            setLastModified(now - 6L * 24L * 60L * 60_000L)
         }
         val expiredShare = File(shareDir, "old_share.wav").apply {
             writeBytes(ByteArray(64))
-            setLastModified(now - 90 * 60_000L)
+            setLastModified(now - 8L * 24L * 60L * 60_000L)
         }
         val cleanedShares = SafeTempStorageCleanup.cleanOldSharedExports(
             context = context,
-            maxAgeMs = 60 * 60_000L,
-            keepMostRecent = 5,
             nowMs = now,
             activeShareFile = activeShare
         )
         assertEquals(1, cleanedShares)
         assertTrue("Currently shared file must remain readable", activeShare.exists())
-        assertFalse("Expired share file must be removed", expiredShare.exists())
+        assertTrue("6-day-old share must be kept under 7-day retention", sixDaysOldShare.exists())
+        assertFalse("8-day-old expired share file must be removed", expiredShare.exists())
+    }
+
+    @Test
+    fun testFileProviderRestrictedToSharedExportsAndUriGrants() {
+        val srcWav = createSineWav("share_fp_src.wav", 440.0, 0.4f, 0.2f)
+        val sharedFile = AudioShareHelper.prepareShareFile(context, srcWav, "Studio Mix")
+
+        val authority = "${context.packageName}.fileprovider"
+        val sharedUri = FileProvider.getUriForFile(context, authority, sharedFile)
+        assertTrue(
+            "FileProvider URI should point to shared_exports root: $sharedUri",
+            sharedUri.toString().contains("/shared_exports/")
+        )
+
+        // Verify FileProvider ContentResolver stream read works for legitimate share
+        context.contentResolver.openInputStream(sharedUri).use { stream ->
+            assertNotNull("FileProvider stream should open for shared_exports file", stream)
+            val bytes = stream!!.readBytes()
+            assertEquals(srcWav.length().toInt(), bytes.size)
+        }
+
+        // Verify ACTION_SEND chooser & inner ACTION_SEND intent carry URI permission grant & ClipData
+        val chooserIntent = AudioShareHelper.buildShareIntent(context, sharedFile, "Share Test WAV")
+        assertEquals(Intent.ACTION_CHOOSER, chooserIntent.action)
+        assertTrue((chooserIntent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0)
+        @Suppress("DEPRECATION")
+        val targetIntent = chooserIntent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)!!
+        assertEquals(Intent.ACTION_SEND, targetIntent.action)
+        assertEquals("audio/wav", targetIntent.type)
+        assertTrue((targetIntent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0)
+        assertNotNull("ClipData should carry shared URI for permission propagation", targetIntent.clipData)
+        @Suppress("DEPRECATION")
+        val extraStream = targetIntent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+        assertEquals(sharedUri, extraStream)
+
+        // Verify internal filesDir and cacheDir outside shared_exports/ are rejected by FileProvider
+        val privateFilesTarget = File(context.filesDir, "private_db_or_recording.wav").apply {
+            writeBytes(ByteArray(32))
+        }
+        val privateCacheTarget = File(context.cacheDir, "unshared_temp.wav").apply {
+            writeBytes(ByteArray(32))
+        }
+        try {
+            FileProvider.getUriForFile(context, authority, privateFilesTarget)
+            fail("FileProvider MUST NOT expose internal filesDir")
+        } catch (_: IllegalArgumentException) {
+            // Expected security restriction
+        }
+        try {
+            FileProvider.getUriForFile(context, authority, privateCacheTarget)
+            fail("FileProvider MUST NOT expose cacheDir outside shared_exports/")
+        } catch (_: IllegalArgumentException) {
+            // Expected security restriction
+        } finally {
+            privateFilesTarget.delete()
+            privateCacheTarget.delete()
+        }
+    }
+
+    @Test
+    fun testSharedWavUniqueNonOverwritingAndAgeOnlyCleanup() {
+        val srcA = createSineWav("share_a.wav", 440.0, 0.4f, 0.1f)
+        val srcB = createSineWav("share_b.wav", 880.0, 0.4f, 0.2f)
+
+        // Prepare 8 consecutive shares with identical display name -> must generate 8 unique files without overwriting
+        val prepared = mutableListOf<File>()
+        repeat(8) { idx ->
+            val src = if (idx == 0) srcA else srcB
+            prepared += AudioShareHelper.prepareShareFile(context, src, "My Track.wav")
+        }
+        assertEquals("All 8 filenames must be unique", 8, prepared.map { it.name }.toSet().size)
+        assertTrue("First shared file must not be overwritten or deleted", prepared.first().exists())
+        assertEquals("First shared file size must match srcA", srcA.length(), prepared.first().length())
+        assertEquals("Later shared file size must match srcB", srcB.length(), prepared.last().length())
+
+        // Recent >5 shares must NOT be deleted when all are within 7-day retention
+        val now = System.currentTimeMillis() + 5_000L
+        val deletedRecent = SafeTempStorageCleanup.cleanOldSharedExports(
+            context = context,
+            nowMs = now,
+            activeShareFile = null
+        )
+        assertEquals("Recent shared files (>5) must not be deleted solely by count", 0, deletedRecent)
+        assertTrue("All 8 recent share files must remain intact", prepared.all { it.exists() })
+
+        // Mark an 8-day-old file active while preparing/sharing -> must NOT be deleted even past 7 days
+        val shareDir = File(context.cacheDir, "shared_exports").apply { mkdirs() }
+        val eightDaysMs = 8L * 24L * 60L * 60_000L
+        val sixDaysMs = 6L * 24L * 60L * 60_000L
+        val inProgressOld = File(shareDir, "active_preparing.wav").apply {
+            writeBytes(ByteArray(64))
+            setLastModified(now - eightDaysMs)
+        }
+        val withinSevenDays = File(shareDir, "within_7_days.wav").apply {
+            writeBytes(ByteArray(64))
+            setLastModified(now - sixDaysMs)
+        }
+        val abandonedOld = File(shareDir, "abandoned_old.wav").apply {
+            writeBytes(ByteArray(64))
+            setLastModified(now - eightDaysMs)
+        }
+        SafeTempStorageCleanup.markShareFileActive(inProgressOld)
+        try {
+            val cleanedOld = SafeTempStorageCleanup.cleanOldSharedExports(
+                context = context,
+                nowMs = now
+            )
+            assertEquals("Only genuinely expired (>7d) inactive share should be deleted", 1, cleanedOld)
+            assertTrue("Active in-progress share must never be deleted", inProgressOld.exists())
+            assertTrue("6-day-old share must remain intact within 7-day retention", withinSevenDays.exists())
+            assertFalse("8-day-old expired abandoned share should be deleted", abandonedOld.exists())
+        } finally {
+            SafeTempStorageCleanup.unmarkShareFileActive(inProgressOld)
+            inProgressOld.delete()
+            withinSevenDays.delete()
+        }
     }
 
     @Test

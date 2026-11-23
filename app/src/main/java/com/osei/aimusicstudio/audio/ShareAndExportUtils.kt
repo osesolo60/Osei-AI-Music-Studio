@@ -1,11 +1,15 @@
 package com.osei.aimusicstudio.audio
 
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import androidx.core.content.FileProvider
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -269,10 +273,29 @@ object SafeTempStorageCleanup {
         return deletedCount
     }
 
+    private val activeSharePaths = ConcurrentHashMap.newKeySet<String>()
+
+    internal fun markShareFileActive(file: File) {
+        try {
+            activeSharePaths.add(file.canonicalPath)
+        } catch (_: Throwable) {
+            activeSharePaths.add(file.absolutePath)
+        }
+    }
+
+    internal fun unmarkShareFileActive(file: File) {
+        try {
+            activeSharePaths.remove(file.canonicalPath)
+        } catch (_: Throwable) {
+            activeSharePaths.remove(file.absolutePath)
+        }
+    }
+
+    const val SHARED_EXPORT_RETENTION_MS: Long = 7L * 24L * 60L * 60_000L // 7 days
+
     fun cleanOldSharedExports(
         context: Context,
-        maxAgeMs: Long = 60 * 60_000L,
-        keepMostRecent: Int = 5,
+        maxAgeMs: Long = SHARED_EXPORT_RETENTION_MS,
         nowMs: Long = System.currentTimeMillis(),
         activeShareFile: File? = null
     ): Int {
@@ -283,23 +306,20 @@ object SafeTempStorageCleanup {
             val activeCanonical = try {
                 activeShareFile?.canonicalPath
             } catch (_: Throwable) {
-                null
+                activeShareFile?.absolutePath
             }
 
-            val files = shareDir.listFiles()?.filter { it.isFile }
-                ?.sortedByDescending { it.lastModified() }
-                .orEmpty()
-
-            files.forEachIndexed { idx, file ->
+            val files = shareDir.listFiles()?.filter { it.isFile }.orEmpty()
+            for (file in files) {
                 val canonical = try {
                     file.canonicalPath
                 } catch (_: Throwable) {
                     file.absolutePath
                 }
-                if (canonical == activeCanonical) return@forEachIndexed
-                val isExpired = (nowMs - file.lastModified()) >= maxAgeMs
-                val exceedsCap = idx >= keepMostRecent
-                if (isExpired || exceedsCap) {
+                if (canonical == activeCanonical || canonical in activeSharePaths) {
+                    continue
+                }
+                if ((nowMs - file.lastModified()) >= maxAgeMs) {
                     if (file.delete()) deletedCount++
                 }
             }
@@ -310,24 +330,52 @@ object SafeTempStorageCleanup {
 }
 
 object AudioShareHelper {
+    private val shareSeq = AtomicLong(0L)
+
     fun prepareShareFile(context: Context, sourceFile: File, shareDisplayName: String): File {
         val shareDir = File(context.cacheDir, "shared_exports").apply { mkdirs() }
-        val cleanName = shareDisplayName.replace(Regex("[^A-Za-z0-9._-]"), "_")
-        val destFile = File(shareDir, if (cleanName.endsWith(".wav", ignoreCase = true)) cleanName else "$cleanName.wav")
-        FileInputStream(sourceFile).use { input ->
-            FileOutputStream(destFile).use { output ->
-                val buf = ByteArray(32 * 1024)
-                var read: Int
-                while (input.read(buf).also { read = it } != -1) {
-                    output.write(buf, 0, read)
-                }
-                output.flush()
+        val baseWithoutExt = shareDisplayName.removeSuffix(".wav").removeSuffix(".WAV")
+        val sanitizedStem = baseWithoutExt
+            .replace(Regex("[^A-Za-z0-9_-]"), "_")
+            .trim('_')
+            .take(48)
+            .ifEmpty { "osei_audio" }
+
+        var destFile: File
+        while (true) {
+            val seq = shareSeq.incrementAndGet()
+            val token = UUID.randomUUID().toString().replace("-", "").take(6)
+            val uniqueName = "${sanitizedStem}_${System.currentTimeMillis()}_${seq}_${token}.wav"
+            val candidate = File(shareDir, uniqueName)
+            if (candidate.createNewFile()) {
+                destFile = candidate
+                break
             }
+        }
+
+        SafeTempStorageCleanup.markShareFileActive(destFile)
+        try {
+            FileInputStream(sourceFile).use { input ->
+                FileOutputStream(destFile).use { output ->
+                    val buf = ByteArray(32 * 1024)
+                    var read: Int
+                    while (input.read(buf).also { read = it } != -1) {
+                        output.write(buf, 0, read)
+                    }
+                    output.flush()
+                }
+            }
+            destFile.setLastModified(System.currentTimeMillis())
+        } catch (t: Throwable) {
+            destFile.delete()
+            SafeTempStorageCleanup.unmarkShareFileActive(destFile)
+            throw t
         }
         SafeTempStorageCleanup.cleanOldSharedExports(
             context = context,
             activeShareFile = destFile
         )
+        SafeTempStorageCleanup.unmarkShareFileActive(destFile)
         return destFile
     }
 
@@ -341,9 +389,11 @@ object AudioShareHelper {
             type = "audio/wav"
             putExtra(Intent.EXTRA_STREAM, uri)
             putExtra(Intent.EXTRA_SUBJECT, wavFile.nameWithoutExtension)
+            clipData = ClipData.newUri(context.contentResolver, wavFile.name, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         return Intent.createChooser(sendIntent, chooserTitle).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
     }
