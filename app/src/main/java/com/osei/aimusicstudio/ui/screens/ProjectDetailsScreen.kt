@@ -100,6 +100,14 @@ fun ProjectDetailsScreen(
                         color = TextGrey,
                         fontSize = 13.sp
                     )
+                    if (project.musicalKey.isNotBlank() || project.bpm > 0) {
+                        val analysisSummary = buildString {
+                            if (project.musicalKey.isNotBlank()) append("Key: ${project.musicalKey}")
+                            if (project.musicalKey.isNotBlank() && project.bpm > 0) append(" • ")
+                            if (project.bpm > 0) append("Tempo: ${project.bpm} BPM")
+                        }
+                        Text(text = analysisSummary, color = NeonPurple, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    }
 
                     if (waveformLoading) {
                         LinearProgressIndicator(

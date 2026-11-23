@@ -262,14 +262,24 @@ class MusicStudioRobolectricTest {
         val engine = StemSeparatorEngine(context)
         val realWav = createRealTestWav("sep_input.wav", 2.0f)
 
-        // 1. Missing model must NOT fabricate stems
-        val twoStemSpec = SeparationModelCatalog.findById("mdx_kim_vocal_2_onnx")
+        // 1. KARA_2 lead/backing model must be rejected as a Vocals/Instrumental substitute
+        val karaSpec = SeparationModelCatalog.findById("mdx_kim_vocal_2_onnx")
+        assertEquals(StemMode.KARAOKE_LEAD_BACKING, karaSpec.stemMode)
+        assertEquals(ModelAvailability.UNAVAILABLE, karaSpec.availability)
+        engine.selectModel(karaSpec)
+        val karaRes = engine.separateStems(Uri.fromFile(realWav).toString())
+        assertTrue("KARA_2 must be rejected for Vocals/Instrumental separation", karaRes.isFailure)
+        assertEquals(ModelStatus.ERROR, engine.modelStatus.value)
+
+        // 2. Missing UVR-MDX-NET-Inst_HQ_4 model must NOT fabricate stems
+        val twoStemSpec = SeparationModelCatalog.findById("uvr_mdx_inst_hq_4")
+        assertEquals("UVR-MDX-NET-Inst_HQ_4.onnx", twoStemSpec.fileName)
         engine.selectModel(twoStemSpec)
         val missingModelRes = engine.separateStems(Uri.fromFile(realWav).toString())
         assertTrue("Missing ONNX model must fail honestly", missingModelRes.isFailure)
         assertEquals(ModelStatus.NOT_DOWNLOADED, engine.modelStatus.value)
 
-        // 2. Corrupted ONNX file must fail validation and NOT create fake stems
+        // 3. Corrupted ONNX file must fail SHA-256 / ONNX validation and NOT create fake stems
         val modelsDir = File(context.filesDir, "onnx_models").apply { mkdirs() }
         val corruptOnnx = File(modelsDir, twoStemSpec.fileName).apply {
             writeBytes(ByteArray(2048) { 0x50 })

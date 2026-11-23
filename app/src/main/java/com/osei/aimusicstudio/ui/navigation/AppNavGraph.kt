@@ -147,6 +147,18 @@ fun AppNavGraph(
                     onBack = { navController.popBackStack() }
                 )
             }
+            composable(Screen.VocalSeparation.route) {
+                VocalSeparationScreen(
+                    viewModel = viewModel,
+                    onBack = { navController.popBackStack() }
+                )
+            }
+            composable(Screen.SongAnalysis.route) {
+                SongAnalysisScreen(
+                    viewModel = viewModel,
+                    onBack = { navController.popBackStack() }
+                )
+            }
             composable("vocal_remover") {
                 VocalRemoverScreen(
                     viewModel = viewModel,
@@ -176,7 +188,11 @@ fun AppNavGraph(
                 )
             }
             composable("ai_music_generator") {
-                AiMusicGeneratorScreen(onBack = { navController.popBackStack() })
+                AiMusicGeneratorScreen(
+                    onBack = { navController.popBackStack() },
+                    onImportAudio = { navController.navigate("audio_import") },
+                    onOpenEditor = { navController.navigate("audio_editor") }
+                )
             }
             composable("ai_music_video") {
                 AiMusicVideoScreen(onBack = { navController.popBackStack() })

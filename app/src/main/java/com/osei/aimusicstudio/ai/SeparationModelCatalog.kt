@@ -2,6 +2,7 @@ package com.osei.aimusicstudio.ai
 
 enum class StemMode(val stems: List<String>) {
     TWO_STEM_VOCAL_INST(listOf("vocals", "instrumental")),
+    KARAOKE_LEAD_BACKING(listOf("lead_vocals", "backing_vocals")),
     FOUR_STEM(listOf("vocals", "drums", "bass", "other")),
     SIX_STEM_HTDEMUCS(listOf("drums", "bass", "other", "vocals", "guitar", "piano")),
     SIX_STEM_INSTRUMENTS(listOf("drums", "bass", "guitar", "strings", "keys", "other"))
@@ -25,43 +26,145 @@ data class SeparationModelSpec(
     val architecture: String,
     val stemMode: StemMode,
     val outputStemOrder: List<String> = stemMode.stems,
+    val primaryStem: String = outputStemOrder.first(),
     val fileName: String,
     val downloadUrl: String?,
+    val expectedSha256: String? = null,
     val approximateDiskMb: Int,
     val estimatedPeakRamMb: Int,
     val quantization: String,
     val sourceRepository: String,
     val codeLicense: String,
     val weightLicense: String,
+    val attributionNotice: String = "",
     val compatibility: HardwareCompatibility,
     val notes: String,
     val availability: ModelAvailability = ModelAvailability.AVAILABLE,
     val inputSampleRateHz: Int = 44100,
     val inputChannels: Int = 2,
+    val nFft: Int = 4096,
+    val hopSize: Int = 1024,
+    val dimF: Int = 2048,
+    val dimT: Int = 256,
+    val compensate: Float = 1.0f,
     val tensorSpecSummary: String = "44.1 kHz Stereo",
     val unavailableReason: String? = null
 )
 
 object SeparationModelCatalog {
+    const val DEFAULT_VOCAL_INST_MODEL_ID = "uvr_mdx_inst_hq_4"
+
+    const val UVR_MIT_ATTRIBUTION =
+        "MIT License — Copyright (c) 2022 Anjok07 / Ultimate Vocal Remover (github.com/Anjok07/ultimatevocalremovergui) & KUIELab MDX-Net (Woosung Choi, Minseok Kim, et al.)."
+
     val models: List<SeparationModelSpec> = listOf(
         SeparationModelSpec(
-            id = "mdx_kim_vocal_2_onnx",
-            displayName = "UVR MDX-Net Kara 2 (2-Stem)",
-            architecture = "MDX-Net STFT TDF-Net (ONNX)",
+            id = "uvr_mdx_inst_hq_4",
+            displayName = "UVR-MDX-NET-Inst_HQ_4 (Vocals / Instrumental)",
+            architecture = "MDX-Net ConvTDFNet (ONNX)",
             stemMode = StemMode.TWO_STEM_VOCAL_INST,
             outputStemOrder = listOf("vocals", "instrumental"),
+            primaryStem = "instrumental",
+            fileName = "UVR-MDX-NET-Inst_HQ_4.onnx",
+            downloadUrl = "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Inst_HQ_4.onnx",
+            expectedSha256 = "3c4b5b9b05090fdf238f38ba5046813982d50e2a652e9cb3324ea79720c3c9c8",
+            approximateDiskMb = 56,
+            estimatedPeakRamMb = 215,
+            quantization = "FP32 ONNX (56.3 MiB / ~59.1 MB)",
+            sourceRepository = "https://github.com/TRvlvr/model_repo/releases/tag/all_public_uvr_models",
+            codeLicense = "MIT License (Anjok07 / Ultimate Vocal Remover)",
+            weightLicense = "MIT License (Open commercial redistribution with attribution permitted)",
+            attributionNotice = UVR_MIT_ATTRIBUTION,
+            compatibility = HardwareCompatibility.RECOMMENDED_4GB,
+            notes = "Recommended 4 GB RAM Vocals/Instrumental model. Directly predicts Instrumental [1,4,2560,256] (n_fft=5120, hop=1024, compensate=1.019) and derives clean Vocals = Mix - Instrumental.",
+            availability = ModelAvailability.AVAILABLE,
+            nFft = 5120,
+            hopSize = 1024,
+            dimF = 2560,
+            dimT = 256,
+            compensate = 1.019f,
+            tensorSpecSummary = "Input [1, 4, 2560, 256] -> Output [1, 4, 2560, 256] (Primary: Instrumental; Vocals = Mix - Primary * 1.019) @ 44.1 kHz"
+        ),
+        SeparationModelSpec(
+            id = "uvr_mdx_inst_hq_3",
+            displayName = "UVR-MDX-NET-Inst_HQ_3 (Vocals / Instrumental)",
+            architecture = "MDX-Net ConvTDFNet (ONNX)",
+            stemMode = StemMode.TWO_STEM_VOCAL_INST,
+            outputStemOrder = listOf("vocals", "instrumental"),
+            primaryStem = "instrumental",
+            fileName = "UVR-MDX-NET-Inst_HQ_3.onnx",
+            downloadUrl = "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Inst_HQ_3.onnx",
+            expectedSha256 = "317554b07fe1ea5279a77f2b1520a41ea4b93432560c4ffd08792c30fddf9adc",
+            approximateDiskMb = 64,
+            estimatedPeakRamMb = 245,
+            quantization = "FP32 ONNX (63.7 MiB / ~66.8 MB)",
+            sourceRepository = "https://github.com/TRvlvr/model_repo/releases/tag/all_public_uvr_models",
+            codeLicense = "MIT License (Anjok07 / Ultimate Vocal Remover)",
+            weightLicense = "MIT License (Open commercial redistribution with attribution permitted)",
+            attributionNotice = UVR_MIT_ATTRIBUTION,
+            compatibility = HardwareCompatibility.RECOMMENDED_4GB,
+            notes = "High-quality full-band UVR instrumental/vocal separator. Directly predicts Instrumental [1,4,3072,256] (n_fft=6144, hop=1024, compensate=1.022); derives Vocals via subtraction.",
+            availability = ModelAvailability.AVAILABLE,
+            nFft = 6144,
+            hopSize = 1024,
+            dimF = 3072,
+            dimT = 256,
+            compensate = 1.022f,
+            tensorSpecSummary = "Input [1, 4, 3072, 256] -> Output [1, 4, 3072, 256] (Primary: Instrumental; Vocals = Mix - Primary * 1.022) @ 44.1 kHz"
+        ),
+        SeparationModelSpec(
+            id = "uvr_mdx_main",
+            displayName = "UVR_MDXNET_Main (Vocals / Instrumental)",
+            architecture = "MDX-Net ConvTDFNet (ONNX)",
+            stemMode = StemMode.TWO_STEM_VOCAL_INST,
+            outputStemOrder = listOf("vocals", "instrumental"),
+            primaryStem = "instrumental",
+            fileName = "UVR_MDXNET_Main.onnx",
+            downloadUrl = "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR_MDXNET_Main.onnx",
+            expectedSha256 = "8289784cda38543ff431add4070662813311a8cccfc0112ca82f76d9dba2b4ca",
+            approximateDiskMb = 64,
+            estimatedPeakRamMb = 260,
+            quantization = "FP32 ONNX (63.7 MiB / ~66.8 MB)",
+            sourceRepository = "https://github.com/TRvlvr/model_repo/releases/tag/all_public_uvr_models",
+            codeLicense = "MIT License (Anjok07 / Ultimate Vocal Remover)",
+            weightLicense = "MIT License (Open commercial redistribution with attribution permitted)",
+            attributionNotice = UVR_MIT_ATTRIBUTION,
+            compatibility = HardwareCompatibility.RECOMMENDED_4GB,
+            notes = "Evaluated UVR_MDXNET_Main model. Directly predicts Instrumental [1,4,3072,256] (n_fft=7680, hop=1024, compensate=1.035; truncated at 17.64 kHz before mix subtraction). Inst_HQ_4 offers lighter RAM and full bandwidth.",
+            availability = ModelAvailability.AVAILABLE,
+            nFft = 7680,
+            hopSize = 1024,
+            dimF = 3072,
+            dimT = 256,
+            compensate = 1.035f,
+            tensorSpecSummary = "Input [1, 4, 3072, 256] -> Output [1, 4, 3072, 256] (Primary: Instrumental; Vocals = Mix - Primary * 1.035) @ 44.1 kHz"
+        ),
+        SeparationModelSpec(
+            id = "mdx_kim_vocal_2_onnx",
+            displayName = "UVR_MDXNET_KARA_2 (Karaoke Lead vs Backing Only — Disallowed for Full Vocal/Inst)",
+            architecture = "MDX-Net STFT TDF-Net (ONNX)",
+            stemMode = StemMode.KARAOKE_LEAD_BACKING,
+            outputStemOrder = listOf("lead_vocals", "backing_vocals"),
+            primaryStem = "backing_vocals",
             fileName = "UVR_MDXNET_KARA_2.onnx",
-            downloadUrl = "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR_MDXNET_KARA_2.onnx",
+            downloadUrl = null,
             approximateDiskMb = 53,
             estimatedPeakRamMb = 230,
-            quantization = "FP32/FP16 ONNX opset 14",
+            quantization = "FP32 ONNX",
             sourceRepository = "https://github.com/Anjok07/ultimatevocalremovergui",
             codeLicense = "MIT License",
-            weightLicense = "MIT License (Open commercial redistribution permitted)",
+            weightLicense = "MIT License",
+            attributionNotice = UVR_MIT_ATTRIBUTION,
             compatibility = HardwareCompatibility.RECOMMENDED_4GB,
-            notes = "Community UVR ONNX release. Extracts Vocals & Instrumental via chunked 44.1 kHz stereo STFT; recommended for 4 GB RAM devices.",
-            availability = ModelAvailability.AVAILABLE,
-            tensorSpecSummary = "Input [1, 4, F, T] STFT -> Output [1, 4, F, T] @ 44.1 kHz"
+            notes = "Lead-vocal vs. backing-vocal karaoke model ONLY. Does NOT separate full vocals from instrumental and must not be substituted for Vocals/Instrumental extraction.",
+            availability = ModelAvailability.UNAVAILABLE,
+            nFft = 4096,
+            hopSize = 1024,
+            dimF = 2048,
+            dimT = 256,
+            compensate = 1.0f,
+            tensorSpecSummary = "Karaoke Lead vs Backing ONLY (Not Vocals/Instrumental)",
+            unavailableReason = "UVR_MDXNET_KARA_2.onnx separates Lead Vocals vs. Backing Vocals only and is disabled as a substitute for full Vocals vs. Instrumental separation. Use UVR-MDX-NET-Inst_HQ_4.onnx instead."
         ),
         SeparationModelSpec(
             id = "spleeter_4stems_quant",
@@ -188,6 +291,7 @@ object SeparationModelCatalog {
             architecture = "Custom ONNX (STFT [1,4,F,T] or Waveform [1,2,N])",
             stemMode = StemMode.TWO_STEM_VOCAL_INST,
             outputStemOrder = listOf("vocals", "instrumental"),
+            primaryStem = "vocals",
             fileName = "custom_local_model.onnx",
             downloadUrl = null,
             approximateDiskMb = 0,
@@ -197,12 +301,17 @@ object SeparationModelCatalog {
             codeLicense = "User-verified",
             weightLicense = "User-verified",
             compatibility = HardwareCompatibility.RECOMMENDED_4GB,
-            notes = "Load a compatible quantized 2-stem ONNX model directly from device storage without internet.",
+            notes = "Load a compatible 2-stem Vocals/Instrumental ONNX model directly from device storage without internet.",
             availability = ModelAvailability.AVAILABLE
         )
     )
 
+    fun defaultVocalInstrumentalModel(): SeparationModelSpec = findById(DEFAULT_VOCAL_INST_MODEL_ID)
+
+    fun vocalInstrumentalModels(): List<SeparationModelSpec> =
+        models.filter { it.stemMode == StemMode.TWO_STEM_VOCAL_INST && it.availability != ModelAvailability.UNAVAILABLE }
+
     fun findById(id: String): SeparationModelSpec {
-        return models.firstOrNull { it.id == id } ?: models.first()
+        return models.firstOrNull { it.id == id } ?: defaultVocalInstrumentalModel()
     }
 }

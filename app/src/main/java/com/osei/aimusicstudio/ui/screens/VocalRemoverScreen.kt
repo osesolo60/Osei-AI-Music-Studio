@@ -64,7 +64,7 @@ fun VocalRemoverScreen(
     val stemVolume by stemPlayer.volume.collectAsStateWithLifecycle()
 
     val twoStemModel = remember {
-        SeparationModelCatalog.models.first { it.stemMode == StemMode.TWO_STEM_VOCAL_INST }
+        SeparationModelCatalog.defaultVocalInstrumentalModel()
     }
     LaunchedEffect(Unit) {
         engine.selectModel(twoStemModel)
@@ -167,6 +167,9 @@ fun VocalRemoverScreen(
                 Text(text = twoStemModel.displayName, color = TextWhite, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 Text(text = "${twoStemModel.architecture} • ${twoStemModel.codeLicense}", color = NeonPurple, fontSize = 12.sp)
                 Text(text = twoStemModel.notes, color = TextGrey, fontSize = 12.sp)
+                if (twoStemModel.attributionNotice.isNotBlank()) {
+                    Text(text = twoStemModel.attributionNotice, color = TextGrey.copy(alpha = 0.85f), fontSize = 10.sp)
+                }
                 Text(
                     text = "Track: ${activeProject?.title ?: "No imported track selected"}",
                     color = TextWhite,
@@ -348,7 +351,9 @@ fun VocalRemoverScreen(
             text = {
                 Text(
                     "Model: ${twoStemModel.displayName}\n" +
+                        "File: ${twoStemModel.fileName}\n" +
                         "License: ${twoStemModel.weightLicense}\n" +
+                        "Attribution: ${twoStemModel.attributionNotice}\n" +
                         "Size: ~${twoStemModel.approximateDiskMb} MB\n\n" +
                         "All audio remains offline on your device."
                 )

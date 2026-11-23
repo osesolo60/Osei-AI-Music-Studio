@@ -148,21 +148,211 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun saveSeparatedStemsToProject(project: MusicProjectEntity, stemFiles: Map<String, File>) {
+    private fun resolveValidStemFileFromUri(uriStr: String?): File? {
+        if (uriStr.isNullOrBlank()) return null
+        val parsed = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return null
+        val file = when {
+            parsed.scheme == "file" && parsed.path != null -> File(parsed.path!!)
+            uriStr.startsWith("/") -> File(uriStr)
+            else -> null
+        } ?: return null
+        val stats = com.osei.aimusicstudio.ai.StemSeparatorEngine.validateStemWavFile(file).getOrNull()
+        return if (stats != null && stats.hasNonZeroAudio) file else null
+    }
+
+    fun saveSeparatedStemsToProject(
+        project: MusicProjectEntity,
+        stemFiles: Map<String, File>,
+        onResult: (Result<MusicProjectEntity>) -> Unit = {}
+    ) {
         viewModelScope.launch {
-            val updated = project.copy(
-                stemsSeparated = true,
-                vocalUri = stemFiles["vocals"]?.let { Uri.fromFile(it).toString() } ?: project.vocalUri,
-                instrumentalUri = stemFiles["instrumental"]?.let { Uri.fromFile(it).toString() } ?: project.instrumentalUri,
-                drumsUri = stemFiles["drums"]?.let { Uri.fromFile(it).toString() } ?: project.drumsUri,
-                bassUri = stemFiles["bass"]?.let { Uri.fromFile(it).toString() } ?: project.bassUri,
-                guitarUri = stemFiles["guitar"]?.let { Uri.fromFile(it).toString() } ?: project.guitarUri,
-                stringsUri = stemFiles["strings"]?.let { Uri.fromFile(it).toString() } ?: project.stringsUri,
-                keysUri = stemFiles["keys"]?.let { Uri.fromFile(it).toString() } ?: project.keysUri,
-                otherUri = stemFiles["other"]?.let { Uri.fromFile(it).toString() } ?: project.otherUri
-            )
-            repository.updateProject(updated)
-            _selectedProjectForTools.value = updated
+            val validationRes = withContext(Dispatchers.IO) {
+                val vocalsFile = stemFiles["vocals"]
+                val instrumentalFile = stemFiles["instrumental"]
+                if (vocalsFile != null || instrumentalFile != null) {
+                    val vStats = vocalsFile?.let {
+                        com.osei.aimusicstudio.ai.StemSeparatorEngine.validateStemWavFile(it).getOrNull()
+                    }
+                    val iStats = instrumentalFile?.let {
+                        com.osei.aimusicstudio.ai.StemSeparatorEngine.validateStemWavFile(it).getOrNull()
+                    }
+                    val vValid = vStats != null && vStats.hasNonZeroAudio
+                    val iValid = iStats != null && iStats.hasNonZeroAudio
+                    if (!vValid || !iValid) {
+                        return@withContext Result.failure<Boolean>(
+                            IllegalStateException("Both vocals and instrumental WAV outputs must pass non-empty audio validation before marking stemsSeparated=true")
+                        )
+                    }
+                    Result.success(true)
+                } else {
+                    val allValid = stemFiles.isNotEmpty() && stemFiles.values.all {
+                        val stats = com.osei.aimusicstudio.ai.StemSeparatorEngine.validateStemWavFile(it).getOrNull()
+                        stats != null && stats.hasNonZeroAudio
+                    }
+                    if (!allValid) {
+                        return@withContext Result.failure<Boolean>(
+                            IllegalStateException("All separated stem WAV outputs must pass non-empty audio validation")
+                        )
+                    }
+                    Result.success(true)
+                }
+            }
+
+            validationRes.onSuccess {
+                val updated = project.copy(
+                    stemsSeparated = true,
+                    vocalUri = stemFiles["vocals"]?.let { Uri.fromFile(it).toString() } ?: project.vocalUri,
+                    instrumentalUri = stemFiles["instrumental"]?.let { Uri.fromFile(it).toString() } ?: project.instrumentalUri,
+                    drumsUri = stemFiles["drums"]?.let { Uri.fromFile(it).toString() } ?: project.drumsUri,
+                    bassUri = stemFiles["bass"]?.let { Uri.fromFile(it).toString() } ?: project.bassUri,
+                    guitarUri = stemFiles["guitar"]?.let { Uri.fromFile(it).toString() } ?: project.guitarUri,
+                    stringsUri = stemFiles["strings"]?.let { Uri.fromFile(it).toString() } ?: project.stringsUri,
+                    keysUri = stemFiles["keys"]?.let { Uri.fromFile(it).toString() } ?: project.keysUri,
+                    otherUri = stemFiles["other"]?.let { Uri.fromFile(it).toString() } ?: project.otherUri
+                )
+                repository.updateProject(updated)
+                _selectedProjectForTools.value = updated
+                if (_currentPlayingProject.value?.id == updated.id) {
+                    _currentPlayingProject.value = updated
+                }
+                onResult(Result.success(updated))
+            }.onFailure { err ->
+                onResult(Result.failure(err))
+            }
+        }
+    }
+
+    fun importAudioUriAsProject(uri: Uri, onResult: (Result<MusicProjectEntity>) -> Unit) {
+        viewModelScope.launch {
+            val appContext = getApplication<Application>().applicationContext
+            val validation = withContext(Dispatchers.IO) {
+                com.osei.aimusicstudio.audio.AudioValidator.inspectAndValidate(appContext, uri)
+            }
+            validation.onSuccess { meta ->
+                val project = MusicProjectEntity(
+                    title = meta.title.ifBlank { meta.displayName },
+                    artist = meta.artist.ifBlank { "Local Audio" },
+                    audioUri = uri.toString(),
+                    durationMs = meta.durationMs,
+                    fileSizeMb = meta.fileSizeBytes / (1024f * 1024f)
+                )
+                val insertedId = repository.insertProject(project)
+                val saved = repository.getProjectById(insertedId) ?: project.copy(id = insertedId)
+                _selectedProjectForTools.value = saved
+                onResult(Result.success(saved))
+            }.onFailure { err ->
+                onResult(Result.failure(err))
+            }
+        }
+    }
+
+    fun saveSeparatedStemPermanently(
+        project: MusicProjectEntity,
+        stemKey: String,
+        sourceWavFile: File,
+        onResult: (Result<MusicProjectEntity>) -> Unit
+    ) {
+        viewModelScope.launch {
+            val copyRes = withContext(Dispatchers.IO) {
+                try {
+                    val stats = com.osei.aimusicstudio.ai.StemSeparatorEngine.validateStemWavFile(sourceWavFile)
+                        .getOrElse { err ->
+                            return@withContext Result.failure<Pair<File, Boolean>>(
+                                IllegalStateException("Cannot save $stemKey: ${err.localizedMessage}")
+                            )
+                        }
+                    if (!stats.hasNonZeroAudio) {
+                        return@withContext Result.failure(
+                            IllegalStateException("Cannot save $stemKey: separated WAV has zero audio amplitude")
+                        )
+                    }
+                    val savedDir = File(getApplication<Application>().filesDir, "saved_stems").apply { mkdirs() }
+                    val safeTitle = project.title.replace(Regex("[^A-Za-z0-9_-]"), "_").take(32).ifEmpty { "song" }
+                    val destFile = File(savedDir, "${safeTitle}_${project.id}_${stemKey}_${System.currentTimeMillis()}.wav")
+                    sourceWavFile.copyTo(destFile, overwrite = true)
+
+                    val savedUri = Uri.fromFile(destFile).toString()
+                    val candidateVocalUri = if (stemKey == "vocals") savedUri else project.vocalUri
+                    val candidateInstUri = if (stemKey == "instrumental") savedUri else project.instrumentalUri
+                    val bothValidated = resolveValidStemFileFromUri(candidateVocalUri) != null &&
+                        resolveValidStemFileFromUri(candidateInstUri) != null
+
+                    Result.success(destFile to bothValidated)
+                } catch (e: Throwable) {
+                    Result.failure(e)
+                }
+            }
+            copyRes.onSuccess { (savedFile, bothValidated) ->
+                val savedUri = Uri.fromFile(savedFile).toString()
+                val updated = when (stemKey) {
+                    "vocals" -> project.copy(stemsSeparated = bothValidated, vocalUri = savedUri)
+                    "instrumental" -> project.copy(stemsSeparated = bothValidated, instrumentalUri = savedUri)
+                    else -> project.copy(stemsSeparated = bothValidated)
+                }
+                repository.updateProject(updated)
+                _selectedProjectForTools.value = updated
+                if (_currentPlayingProject.value?.id == updated.id) {
+                    _currentPlayingProject.value = updated
+                }
+                onResult(Result.success(updated))
+            }.onFailure { err ->
+                onResult(Result.failure(err))
+            }
+        }
+    }
+
+    fun prepareShareIntentForWav(
+        sourceWavFile: File,
+        displayTitle: String,
+        onResult: (Result<android.content.Intent>) -> Unit
+    ) {
+        viewModelScope.launch {
+            val app = getApplication<Application>()
+            val res = withContext(Dispatchers.IO) {
+                try {
+                    if (!sourceWavFile.exists() || sourceWavFile.length() <= 44L) {
+                        return@withContext Result.failure(IllegalStateException("Separated WAV file is missing"))
+                    }
+                    val sharedFile = com.osei.aimusicstudio.audio.AudioShareHelper.prepareShareFile(
+                        context = app,
+                        sourceFile = sourceWavFile,
+                        shareDisplayName = displayTitle
+                    )
+                    val intent = com.osei.aimusicstudio.audio.AudioShareHelper.buildShareIntent(
+                        context = app,
+                        wavFile = sharedFile,
+                        chooserTitle = "Share $displayTitle"
+                    )
+                    Result.success(intent)
+                } catch (t: Throwable) {
+                    Result.failure(t)
+                }
+            }
+            onResult(res)
+        }
+    }
+
+    fun saveSongAnalysisResults(
+        project: MusicProjectEntity,
+        bpm: Int?,
+        musicalKey: String?,
+        onResult: (Result<MusicProjectEntity>) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            try {
+                val updated = project.copy(
+                    bpm = bpm ?: 0,
+                    musicalKey = musicalKey?.trim().orEmpty()
+                )
+                repository.updateProject(updated)
+                _selectedProjectForTools.value = updated
+                if (_currentPlayingProject.value?.id == updated.id) {
+                    _currentPlayingProject.value = updated
+                }
+                onResult(Result.success(updated))
+            } catch (t: Throwable) {
+                onResult(Result.failure(t))
+            }
         }
     }
 

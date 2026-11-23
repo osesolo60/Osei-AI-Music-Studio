@@ -44,6 +44,26 @@ fun AiToolsScreen(onNavigate: (String) -> Unit) {
 
         item {
             AiToolItemCard(
+                title = "Vocal Separation",
+                description = "Import song, extract or remove vocals with AI, play stems, save & share.",
+                icon = Icons.Default.Mic,
+                modifier = Modifier.testTag("ai_tools_vocal_separation_card"),
+                onClick = { onNavigate("vocal_separation") }
+            )
+        }
+
+        item {
+            AiToolItemCard(
+                title = "Song Analysis",
+                description = "Local audio analysis for musical key, BPM, confidence & manual key correction.",
+                icon = Icons.Default.GraphicEq,
+                modifier = Modifier.testTag("ai_tools_song_analysis_card"),
+                onClick = { onNavigate("song_analysis") }
+            )
+        }
+
+        item {
+            AiToolItemCard(
                 title = "AI Vocal Remover",
                 description = "Extract high-quality instrumental and vocal tracks from any song.",
                 icon = Icons.Default.MicOff,

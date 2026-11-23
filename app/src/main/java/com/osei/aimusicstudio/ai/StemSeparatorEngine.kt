@@ -8,6 +8,7 @@ import ai.onnxruntime.TensorInfo
 import android.content.Context
 import android.net.Uri
 import com.osei.aimusicstudio.audio.StreamingAudioDecoder
+import com.osei.aimusicstudio.audio.WavStreamReader
 import com.osei.aimusicstudio.audio.WavStreamWriter
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -17,14 +18,23 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import java.io.BufferedInputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
+import kotlin.math.log10
+import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 enum class ModelStatus {
     NOT_DOWNLOADED,
@@ -36,14 +46,28 @@ enum class ModelStatus {
     ERROR
 }
 
+data class StemAudioStats(
+    val file: File,
+    val sampleRate: Int,
+    val channels: Int,
+    val frameCount: Long,
+    val durationMs: Long,
+    val peakAmplitude: Float,
+    val rmsDbfs: Float
+) {
+    val hasNonZeroAudio: Boolean
+        get() = frameCount > 0L && peakAmplitude > 1e-5f
+}
+
 data class SeparationResult(
     val stemFiles: Map<String, File>,
+    val stemStats: Map<String, StemAudioStats>,
     val benchmark: InferenceBenchmark,
     val modelSpec: SeparationModelSpec
 )
 
 class StemSeparatorEngine(private val context: Context) {
-    private val _selectedModel = MutableStateFlow(SeparationModelCatalog.models.first())
+    private val _selectedModel = MutableStateFlow(SeparationModelCatalog.defaultVocalInstrumentalModel())
     val selectedModel: StateFlow<SeparationModelSpec> = _selectedModel.asStateFlow()
 
     private val _modelStatus = MutableStateFlow(ModelStatus.NOT_DOWNLOADED)
@@ -68,6 +92,7 @@ class StemSeparatorEngine(private val context: Context) {
     val modelSha256: StateFlow<String?> = _modelSha256.asStateFlow()
 
     private val cancelRequested = AtomicBoolean(false)
+    private val verifiedFileStamps = ConcurrentHashMap<String, String>()
 
     private val modelsDir: File
         get() = File(context.filesDir, "onnx_models").apply { mkdirs() }
@@ -99,8 +124,10 @@ class StemSeparatorEngine(private val context: Context) {
         }
         val file = modelFileFor(spec)
         if (file.exists() && file.length() > 1024L) {
+            val stamp = "${file.absolutePath}:${file.length()}:${file.lastModified()}"
+            _modelSha256.value = verifiedFileStamps[stamp]
             _modelStatus.value = ModelStatus.READY
-            _statusMessage.value = "Model file present (${file.length() / (1024 * 1024)} MB). Ready for validation & CPU inference."
+            _statusMessage.value = "Model file present (${file.length() / (1024 * 1024)} MB). Ready for checksum/ONNX verification & CPU inference."
         } else {
             _modelStatus.value = ModelStatus.NOT_DOWNLOADED
             _modelSha256.value = null
@@ -119,7 +146,8 @@ class StemSeparatorEngine(private val context: Context) {
 
     /**
      * Downloads verified open-source ONNX weights ONLY when user explicitly consents.
-     * Never writes fake fallback bytes if network or storage fails.
+     * Enforces SHA-256 verification and ONNX Runtime loadability before accepting the file.
+     * Never writes fake fallback bytes if network, checksum, or storage fails.
      */
     suspend fun downloadModelWithConsent(): Result<File> = withContext(Dispatchers.IO) {
         val spec = _selectedModel.value
@@ -194,9 +222,17 @@ class StemSeparatorEngine(private val context: Context) {
                 throw IllegalStateException("Downloaded file is too small to be a valid ONNX model")
             }
 
-            // Validate ONNX loadability before promoting to active model
-            _statusMessage.value = "Verifying ONNX model integrity..."
-            validateOnnxModelFile(tempFile)
+            val sha = digest.digest().joinToString("") { "%02x".format(it) }
+            val expected = spec.expectedSha256
+            if (!expected.isNullOrBlank() && !sha.equals(expected, ignoreCase = true)) {
+                throw IllegalStateException(
+                    "SHA-256 checksum mismatch for ${spec.fileName}: expected ${expected.take(16)}..., got ${sha.take(16)}..."
+                )
+            }
+
+            // Validate ONNX loadability and tensor signature before promoting to active model
+            _statusMessage.value = "Verifying ONNX model graph & tensor shapes..."
+            validateOnnxModelForSpec(tempFile, spec)
 
             if (targetFile.exists()) targetFile.delete()
             if (!tempFile.renameTo(targetFile)) {
@@ -204,7 +240,8 @@ class StemSeparatorEngine(private val context: Context) {
                 tempFile.delete()
             }
 
-            val sha = digest.digest().joinToString("") { "%02x".format(it) }
+            val stamp = "${targetFile.absolutePath}:${targetFile.length()}:${targetFile.lastModified()}"
+            verifiedFileStamps[stamp] = sha
             _modelSha256.value = sha
             _progress.value = 1f
             _modelStatus.value = ModelStatus.READY
@@ -234,8 +271,8 @@ class StemSeparatorEngine(private val context: Context) {
     }
 
     /**
-     * Imports a user-supplied .onnx model via Storage Access Framework and validates it
-     * with ONNX Runtime before accepting it.
+     * Imports a user-supplied .onnx model via Storage Access Framework and validates both
+     * SHA-256 (for known catalog models) and ONNX Runtime loadability before accepting it.
      */
     suspend fun importLocalOnnxModel(uri: Uri): Result<File> = withContext(Dispatchers.IO) {
         val spec = _selectedModel.value
@@ -270,7 +307,15 @@ class StemSeparatorEngine(private val context: Context) {
                 }
             }
 
-            validateOnnxModelFile(tempFile)
+            val sha = digest.digest().joinToString("") { "%02x".format(it) }
+            val expected = spec.expectedSha256
+            if (!expected.isNullOrBlank() && !sha.equals(expected, ignoreCase = true)) {
+                throw IllegalStateException(
+                    "SHA-256 mismatch for ${spec.fileName}: expected ${expected.take(16)}..., got ${sha.take(16)}... (wrong or modified model file)."
+                )
+            }
+
+            validateOnnxModelForSpec(tempFile, spec)
 
             if (targetFile.exists()) targetFile.delete()
             if (!tempFile.renameTo(targetFile)) {
@@ -278,7 +323,8 @@ class StemSeparatorEngine(private val context: Context) {
                 tempFile.delete()
             }
 
-            val sha = digest.digest().joinToString("") { "%02x".format(it) }
+            val stamp = "${targetFile.absolutePath}:${targetFile.length()}:${targetFile.lastModified()}"
+            verifiedFileStamps[stamp] = sha
             _modelSha256.value = sha
             _modelStatus.value = ModelStatus.READY
             _statusMessage.value = "Local ONNX model verified (SHA-256: ${sha.take(12)}...)"
@@ -294,9 +340,15 @@ class StemSeparatorEngine(private val context: Context) {
     }
 
     /**
-     * Validates that [file] can actually be opened by ONNX Runtime Mobile with low-memory options.
+     * Validates that [file] can actually be opened by ONNX Runtime with low-memory options
+     * and returns (inputName, inputShape, outputShape).
      */
     fun validateOnnxModelFile(file: File): Pair<String, LongArray> {
+        val meta = inspectOnnxModelMetadata(file)
+        return Pair(meta.first, meta.second)
+    }
+
+    private fun inspectOnnxModelMetadata(file: File): Triple<String, LongArray, LongArray> {
         if (!file.exists() || file.length() <= 16L) {
             throw IllegalArgumentException("ONNX model file is missing or empty")
         }
@@ -308,22 +360,52 @@ class StemSeparatorEngine(private val context: Context) {
             session = env.createSession(file.absolutePath, opts)
             val inputEntry = session.inputInfo.entries.firstOrNull()
                 ?: throw OrtException("ONNX model has no input tensors")
-            val tensorInfo = inputEntry.value.info as? TensorInfo
+            val inputInfo = inputEntry.value.info as? TensorInfo
                 ?: throw OrtException("ONNX input '${inputEntry.key}' is not a Tensor")
-            if (session.outputInfo.isEmpty()) {
-                throw OrtException("ONNX model has no output tensors")
-            }
-            return Pair(inputEntry.key, tensorInfo.shape)
+            val outputEntry = session.outputInfo.entries.firstOrNull()
+                ?: throw OrtException("ONNX model has no output tensors")
+            val outputInfo = outputEntry.value.info as? TensorInfo
+                ?: throw OrtException("ONNX output '${outputEntry.key}' is not a Tensor")
+            return Triple(inputEntry.key, inputInfo.shape, outputInfo.shape)
         } finally {
-            try {
-                session?.close()
-            } catch (_: Throwable) {
+            try { session?.close() } catch (_: Throwable) {}
+            try { opts.close() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun validateOnnxModelForSpec(file: File, spec: SeparationModelSpec) {
+        val (_, inShape, outShape) = inspectOnnxModelMetadata(file)
+        if (spec.stemMode == StemMode.TWO_STEM_VOCAL_INST && spec.id != "local_custom_onnx") {
+            if (inShape.size != 4 || inShape[1] != 4L) {
+                throw OrtException(
+                    "Unexpected ONNX input shape ${inShape.contentToString()} for ${spec.fileName}; expected [B, 4, ${spec.dimF}, ${spec.dimT}]"
+                )
             }
-            try {
-                opts.close()
-            } catch (_: Throwable) {
+            if (inShape[2] > 0L && inShape[2].toInt() != spec.dimF) {
+                throw OrtException(
+                    "ONNX frequency bins (${inShape[2]}) do not match expected dim_f=${spec.dimF} for ${spec.fileName}"
+                )
+            }
+            if (outShape.size != 4 || outShape[1] != 4L) {
+                throw OrtException(
+                    "Unexpected ONNX output shape ${outShape.contentToString()} for ${spec.fileName}; expected [B, 4, ${spec.dimF}, ${spec.dimT}]"
+                )
             }
         }
+    }
+
+    private fun ensureModelChecksumVerified(file: File, spec: SeparationModelSpec) {
+        val expected = spec.expectedSha256 ?: return
+        val stamp = "${file.absolutePath}:${file.length()}:${file.lastModified()}"
+        val cachedSha = verifiedFileStamps[stamp]
+        val actualSha = cachedSha ?: computeFileSha256(file)
+        if (!actualSha.equals(expected, ignoreCase = true)) {
+            throw IllegalStateException(
+                "Unverified model checksum for ${spec.fileName}: expected ${expected.take(16)}..., got ${actualSha.take(16)}..."
+            )
+        }
+        verifiedFileStamps[stamp] = actualSha
+        _modelSha256.value = actualSha
     }
 
     private fun createLowMemorySessionOptions(config: LowMemoryInferenceConfig): OrtSession.SessionOptions {
@@ -348,9 +430,9 @@ class StemSeparatorEngine(private val context: Context) {
         val spec = _selectedModel.value
         val modelFile = modelFileFor(spec)
 
-        if (spec.availability == ModelAvailability.UNAVAILABLE) {
+        if (spec.availability == ModelAvailability.UNAVAILABLE || spec.stemMode == StemMode.KARAOKE_LEAD_BACKING) {
             val err = IllegalStateException(
-                spec.unavailableReason ?: "${spec.displayName} is unavailable for Android ONNX separation."
+                spec.unavailableReason ?: "${spec.displayName} is unavailable for Vocals/Instrumental ONNX separation."
             )
             _errorMessage.value = err.message
             _modelStatus.value = ModelStatus.ERROR
@@ -367,7 +449,7 @@ class StemSeparatorEngine(private val context: Context) {
 
         if (!modelFile.exists() || modelFile.length() <= 16L) {
             val err = IllegalStateException(
-                "ONNX model '${spec.fileName}' is not installed. Download with consent or import a local .onnx file first."
+                "ONNX model '${spec.fileName}' is not installed. Download with consent or import a verified .onnx file first."
             )
             _errorMessage.value = err.message
             _modelStatus.value = ModelStatus.NOT_DOWNLOADED
@@ -390,14 +472,13 @@ class StemSeparatorEngine(private val context: Context) {
         _errorMessage.value = null
         _modelStatus.value = ModelStatus.PROCESSING
         _progress.value = 0f
-        _statusMessage.value = "Initializing ONNX Runtime CPU session (${config.chunkSeconds}s chunks)..."
+        _statusMessage.value = "Verifying model checksum & initializing ONNX CPU session..."
 
         val startTimeMs = System.currentTimeMillis()
         val baselineUsedMb = initialSnap.combinedProcessUsedMb
         var afterModelLoadUsedMb = baselineUsedMb
         var peakUsedMb = baselineUsedMb
         var chunksProcessed = 0
-        var oomRecovered = false
 
         val tempDir = File(context.cacheDir, "stems_tmp_${System.currentTimeMillis()}").apply { mkdirs() }
         val finalDir = File(context.filesDir, "stems/project_${projectId}_${System.currentTimeMillis()}").apply { mkdirs() }
@@ -410,6 +491,8 @@ class StemSeparatorEngine(private val context: Context) {
         var session: OrtSession? = null
 
         try {
+            ensureModelChecksumVerified(modelFile, spec)
+
             val env = OrtEnvironment.getEnvironment()
             sessionOpts = createLowMemorySessionOptions(config)
             session = env.createSession(modelFile.absolutePath, sessionOpts)
@@ -426,10 +509,18 @@ class StemSeparatorEngine(private val context: Context) {
                 ?: throw OrtException("Unsupported input tensor type")
 
             val sampleRate = StreamingAudioDecoder.TARGET_SAMPLE_RATE
-            val chunkFrames = if (inputShape.size == 3 && inputShape[2] > 0L) {
-                inputShape[2].toInt().coerceAtMost((config.chunkSeconds * sampleRate).toInt().coerceAtLeast(4096))
-            } else {
-                (config.chunkSeconds * sampleRate).toInt().coerceAtLeast(4096)
+            val isMdx4ChannelStft = inputShape.size == 4 &&
+                (inputShape[1] == 4L || (inputShape[1] <= 0L && spec.stemMode == StemMode.TWO_STEM_VOCAL_INST))
+
+            val chunkFrames = when {
+                inputShape.size == 3 && inputShape[2] > 0L ->
+                    inputShape[2].toInt().coerceAtMost((config.chunkSeconds * sampleRate).toInt().coerceAtLeast(4096))
+                isMdx4ChannelStft -> {
+                    val modelDimT = if (inputShape[3] > 0L) inputShape[3].toInt() else spec.dimT
+                    // Exact centered-STFT chunk frames: (dim_t - 1) * hop_size fills dim_t frames cleanly
+                    ((modelDimT - 1) * spec.hopSize).coerceAtLeast(4096)
+                }
+                else -> (config.chunkSeconds * sampleRate).toInt().coerceAtLeast(4096)
             }
             val overlapFrames = (config.overlapSeconds * sampleRate).toInt().coerceIn(512, chunkFrames / 3)
             val stepFrames = chunkFrames - overlapFrames
@@ -440,14 +531,13 @@ class StemSeparatorEngine(private val context: Context) {
                 stitchers[stem] = StereoOverlapAddStitcher(overlapFrames)
             }
 
-            val stftProcessor = StftProcessor(fftSize = 4096, hopSize = 1024)
-            // Single sliding window buffer in RAM: only ~1 chunk!
+            val stftProcessor = StftProcessor(fftSize = spec.nFft, hopSize = spec.hopSize)
             val slidingWindow = FloatArray(chunkFrames * 2)
             var bufferedFrames = 0
 
             val jobContext = currentCoroutineContext()
             val audioUri = Uri.parse(audioUriString)
-            _statusMessage.value = "Streaming audio & running chunked CPU inference..."
+            _statusMessage.value = "Streaming audio & running chunked ONNX CPU inference..."
 
             StreamingAudioDecoder.streamStereoChunks(
                 context = context,
@@ -478,6 +568,7 @@ class StemSeparatorEngine(private val context: Context) {
                                 session = session!!,
                                 inputName = inputName,
                                 inputShape = inputShape,
+                                spec = spec,
                                 chunkStereo = slidingWindow,
                                 frameCount = chunkFrames,
                                 stemNames = stemNames,
@@ -488,7 +579,6 @@ class StemSeparatorEngine(private val context: Context) {
                             )
                             chunksProcessed++
 
-                            // Shift overlap tail to beginning of sliding window
                             val remainFrames = bufferedFrames - stepFrames
                             if (remainFrames > 0) {
                                 System.arraycopy(slidingWindow, stepFrames * 2, slidingWindow, 0, remainFrames * 2)
@@ -509,13 +599,13 @@ class StemSeparatorEngine(private val context: Context) {
                 throw CancellationException("Separation cancelled by user")
             }
 
-            // Process remaining tail frames if any
             if (bufferedFrames > 0) {
                 runSingleChunkInference(
                     env = env,
                     session = session,
                     inputName = inputName,
                     inputShape = inputShape,
+                    spec = spec,
                     chunkStereo = slidingWindow,
                     frameCount = bufferedFrames,
                     stemNames = stemNames,
@@ -527,7 +617,6 @@ class StemSeparatorEngine(private val context: Context) {
                 chunksProcessed++
             }
 
-            // Flush any remaining overlap tails and close WAV headers
             val finalFiles = LinkedHashMap<String, File>()
             for (stem in stemNames) {
                 val (tmpFile, writer) = tempWriters.getValue(stem)
@@ -545,6 +634,18 @@ class StemSeparatorEngine(private val context: Context) {
             }
             tempWriters.clear()
 
+            // Validate every output WAV file contains valid non-empty, non-zero audio frames
+            val validatedStats = LinkedHashMap<String, StemAudioStats>()
+            for ((stem, file) in finalFiles) {
+                val stats = validateStemWavFile(file).getOrElse { err ->
+                    throw IllegalStateException("Validated output check failed for $stem: ${err.localizedMessage}")
+                }
+                if (!stats.hasNonZeroAudio) {
+                    throw IllegalStateException("Separated output '$stem' contains silent/zero audio and failed validation.")
+                }
+                validatedStats[stem] = stats
+            }
+
             val totalDurationMs = System.currentTimeMillis() - startTimeMs
             val finalSnap = MemoryProfiler.captureSnapshot(context)
             peakUsedMb = maxOf(peakUsedMb, finalSnap.combinedProcessUsedMb)
@@ -558,7 +659,7 @@ class StemSeparatorEngine(private val context: Context) {
                 peakUsedMb = peakUsedMb,
                 totalDurationMs = totalDurationMs,
                 chunksProcessed = chunksProcessed,
-                chunkSeconds = config.chunkSeconds,
+                chunkSeconds = chunkFrames.toFloat() / sampleRate.toFloat(),
                 oomRecovered = false
             )
             _lastBenchmark.value = benchmark
@@ -566,14 +667,13 @@ class StemSeparatorEngine(private val context: Context) {
             _modelStatus.value = ModelStatus.COMPLETED
             _statusMessage.value = "Completed in ${totalDurationMs / 1000.0}s • Peak RAM: $peakUsedMb MB"
 
-            Result.success(SeparationResult(finalFiles, benchmark, spec))
+            Result.success(SeparationResult(finalFiles, validatedStats, benchmark, spec))
         } catch (ce: CancellationException) {
             _modelStatus.value = ModelStatus.CANCELLED
             _statusMessage.value = "Separation cancelled; temporary files cleaned up."
             cleanupTempFiles(tempWriters, tempDir, finalDir)
             Result.failure(ce)
         } catch (oom: OutOfMemoryError) {
-            oomRecovered = true
             cleanupTempFiles(tempWriters, tempDir, finalDir)
             try { session?.close() } catch (_: Throwable) {}
             session = null
@@ -591,7 +691,7 @@ class StemSeparatorEngine(private val context: Context) {
                 chunkSeconds = config.chunkSeconds,
                 oomRecovered = true
             )
-            val msg = "OutOfMemoryError on ${initialSnap.deviceTotalMb} MB device while running ${spec.displayName}. Close background apps or switch to a 2-stem quantized model."
+            val msg = "OutOfMemoryError on ${initialSnap.deviceTotalMb} MB device while running ${spec.displayName}. Close background apps or verify free RAM."
             _errorMessage.value = msg
             _modelStatus.value = ModelStatus.ERROR
             _statusMessage.value = "OOM recovered safely"
@@ -617,6 +717,7 @@ class StemSeparatorEngine(private val context: Context) {
         session: OrtSession,
         inputName: String,
         inputShape: LongArray,
+        spec: SeparationModelSpec,
         chunkStereo: FloatArray,
         frameCount: Int,
         stemNames: List<String>,
@@ -636,7 +737,6 @@ class StemSeparatorEngine(private val context: Context) {
         var ortResult: OrtSession.Result? = null
         try {
             if (inputShape.size == 3) {
-                // Waveform-domain ONNX input: [batch=1, channels=2, samples]
                 val targetSamples = if (inputShape[2] > 0L) inputShape[2].toInt() else frameCount
                 val buf = FloatBuffer.allocate(2 * targetSamples)
                 for (i in 0 until targetSamples) {
@@ -650,12 +750,22 @@ class StemSeparatorEngine(private val context: Context) {
                 ortResult = session.run(mapOf(inputName to inputTensor))
                 mapWaveformResultToStems(ortResult, frameCount, stemNames, isLastChunk, stitchers, writers)
             } else if (inputShape.size == 4) {
-                // Spectrogram-domain ONNX input (e.g. MDX-Net [1, 4, F, T] or Spleeter [1, 2, F, T])
-                val (lReal, lImag, numFrames) = stftProcessor.stft(left)
-                val (rReal, rImag, _) = stftProcessor.stft(right)
-                val freqBins = if (inputShape[2] > 0L) inputShape[2].toInt() else stftProcessor.numBins
-                val timeFrames = if (inputShape[3] > 0L) inputShape[3].toInt() else numFrames
                 val channelsDim = if (inputShape[1] > 0L) inputShape[1].toInt() else 4
+                val useMdxCentered = channelsDim == 4
+
+                val (lReal, lImag, numFrames) = if (useMdxCentered) {
+                    stftProcessor.stftCenteredHann(left)
+                } else {
+                    stftProcessor.stft(left)
+                }
+                val (rReal, rImag, _) = if (useMdxCentered) {
+                    stftProcessor.stftCenteredHann(right)
+                } else {
+                    stftProcessor.stft(right)
+                }
+
+                val freqBins = if (inputShape[2] > 0L) inputShape[2].toInt() else spec.dimF.coerceAtMost(stftProcessor.numBins)
+                val timeFrames = if (inputShape[3] > 0L) inputShape[3].toInt() else spec.dimT.coerceAtLeast(numFrames)
 
                 val tensorFloatCount = channelsDim * freqBins * timeFrames
                 val buf = FloatBuffer.allocate(tensorFloatCount)
@@ -663,18 +773,17 @@ class StemSeparatorEngine(private val context: Context) {
                 val modelFrames = min(timeFrames, numFrames)
 
                 if (channelsDim == 4) {
-                    // [L_real, L_imag, R_real, R_imag]
+                    // UVR MDX-Net ordering: [L_real, L_imag, R_real, R_imag]
                     fillSpectrogramChannel(buf, lReal, stftProcessor.numBins, modelBins, modelFrames, freqBins, timeFrames)
                     fillSpectrogramChannel(buf, lImag, stftProcessor.numBins, modelBins, modelFrames, freqBins, timeFrames)
                     fillSpectrogramChannel(buf, rReal, stftProcessor.numBins, modelBins, modelFrames, freqBins, timeFrames)
                     fillSpectrogramChannel(buf, rImag, stftProcessor.numBins, modelBins, modelFrames, freqBins, timeFrames)
                 } else {
-                    // Magnitude spectrogram [L_mag, R_mag]
                     val lMag = FloatArray(lReal.size) { idx ->
-                        kotlin.math.sqrt(lReal[idx] * lReal[idx] + lImag[idx] * lImag[idx])
+                        sqrt(lReal[idx] * lReal[idx] + lImag[idx] * lImag[idx])
                     }
                     val rMag = FloatArray(rReal.size) { idx ->
-                        kotlin.math.sqrt(rReal[idx] * rReal[idx] + rImag[idx] * rImag[idx])
+                        sqrt(rReal[idx] * rReal[idx] + rImag[idx] * rImag[idx])
                     }
                     fillSpectrogramChannel(buf, lMag, stftProcessor.numBins, modelBins, modelFrames, freqBins, timeFrames)
                     if (channelsDim >= 2) {
@@ -690,6 +799,9 @@ class StemSeparatorEngine(private val context: Context) {
                 ortResult = session.run(mapOf(inputName to inputTensor))
                 mapSpectrogramResultToStems(
                     ortResult = ortResult,
+                    spec = spec,
+                    leftMix = left,
+                    rightMix = right,
                     lReal = lReal,
                     lImag = lImag,
                     rReal = rReal,
@@ -741,7 +853,6 @@ class StemSeparatorEngine(private val context: Context) {
         val shape = outputTensor.info.shape
         val floatBuf = outputTensor.floatBuffer
 
-        // Support exact [1, stems, 2, N] multi-stem waveform tensors matching spec.outputStemOrder
         if (shape.size == 4 && shape[1] == stemNames.size.toLong() && shape[2] == 2L) {
             val outSamples = shape[3].toInt()
             val strideStem = 2 * outSamples
@@ -765,6 +876,9 @@ class StemSeparatorEngine(private val context: Context) {
 
     private fun mapSpectrogramResultToStems(
         ortResult: OrtSession.Result,
+        spec: SeparationModelSpec,
+        leftMix: FloatArray,
+        rightMix: FloatArray,
         lReal: FloatArray,
         lImag: FloatArray,
         rReal: FloatArray,
@@ -783,7 +897,7 @@ class StemSeparatorEngine(private val context: Context) {
         val floatBuf = outputTensor.floatBuffer
 
         if (shape.size == 4 && shape[1] == 4L) {
-            // 2-stem MDX-Net style output: [1, 4, F, T] -> primary stem complex STFT; secondary = mix - primary
+            // 2-stem MDX-Net output: [1, 4, F, T] represents spec.primaryStem; secondary = mix - primary * compensate
             val outF = shape[2].toInt()
             val outT = shape[3].toInt()
             val bins = stftProcessor.numBins
@@ -806,37 +920,33 @@ class StemSeparatorEngine(private val context: Context) {
                 }
             }
 
-            val primL = stftProcessor.istft(primLReal, primLImag, numFrames, frameCount)
-            val primR = stftProcessor.istft(primRReal, primRImag, numFrames, frameCount)
+            val primL = stftProcessor.istftCenteredHann(primLReal, primLImag, numFrames, frameCount)
+            val primR = stftProcessor.istftCenteredHann(primRReal, primRImag, numFrames, frameCount)
 
+            val comp = spec.compensate
             val primStereo = FloatArray(frameCount * 2)
+            val secStereo = FloatArray(frameCount * 2)
             for (i in 0 until frameCount) {
-                primStereo[i * 2] = primL[i]
-                primStereo[i * 2 + 1] = primR[i]
+                val pL = primL[i] * comp
+                val pR = primR[i] * comp
+                primStereo[i * 2] = pL
+                primStereo[i * 2 + 1] = pR
+                secStereo[i * 2] = leftMix[i] - pL
+                secStereo[i * 2 + 1] = rightMix[i] - pR
             }
-            val firstStem = stemNames.first()
-            val emitPrim = stitchers.getValue(firstStem).processChunk(primStereo, frameCount, isLastChunk)
-            writers.getValue(firstStem).second.writeFloatSamples(emitPrim)
 
-            if (stemNames.size >= 2) {
-                val resLReal = FloatArray(lReal.size) { i -> lReal[i] - primLReal[i] }
-                val resLImag = FloatArray(lImag.size) { i -> lImag[i] - primLImag[i] }
-                val resRReal = FloatArray(rReal.size) { i -> rReal[i] - primRReal[i] }
-                val resRImag = FloatArray(rImag.size) { i -> rImag[i] - primRImag[i] }
+            val primaryKey = stemNames.firstOrNull { it.equals(spec.primaryStem, ignoreCase = true) }
+                ?: stemNames.first()
+            val secondaryKey = stemNames.firstOrNull { !it.equals(primaryKey, ignoreCase = true) }
 
-                val secL = stftProcessor.istft(resLReal, resLImag, numFrames, frameCount)
-                val secR = stftProcessor.istft(resRReal, resRImag, numFrames, frameCount)
-                val secStereo = FloatArray(frameCount * 2)
-                for (i in 0 until frameCount) {
-                    secStereo[i * 2] = secL[i]
-                    secStereo[i * 2 + 1] = secR[i]
-                }
-                val secondStem = stemNames[1]
-                val emitSec = stitchers.getValue(secondStem).processChunk(secStereo, frameCount, isLastChunk)
-                writers.getValue(secondStem).second.writeFloatSamples(emitSec)
+            val emitPrim = stitchers.getValue(primaryKey).processChunk(primStereo, frameCount, isLastChunk)
+            writers.getValue(primaryKey).second.writeFloatSamples(emitPrim)
+
+            if (secondaryKey != null) {
+                val emitSec = stitchers.getValue(secondaryKey).processChunk(secStereo, frameCount, isLastChunk)
+                writers.getValue(secondaryKey).second.writeFloatSamples(emitSec)
             }
         } else if (ortResult.size() >= stemNames.size) {
-            // Multi-output mask/spectrogram model (e.g. Spleeter 4-stem ONNX with 4 output tensors)
             for ((sIdx, stem) in stemNames.withIndex()) {
                 val stemTensor = ortResult[sIdx] as? OnnxTensor
                     ?: throw OrtException("Output $sIdx is not an OnnxTensor")
@@ -889,5 +999,101 @@ class StemSeparatorEngine(private val context: Context) {
         writers.clear()
         try { tempDir.deleteRecursively() } catch (_: Throwable) {}
         try { finalDir.deleteRecursively() } catch (_: Throwable) {}
+    }
+
+    companion object {
+        fun computeFileSha256(file: File): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            FileInputStream(file).use { fis ->
+                val buf = ByteArray(64 * 1024)
+                var read: Int
+                while (fis.read(buf).also { read = it } != -1) {
+                    digest.update(buf, 0, read)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        }
+
+        fun validateStemWavFile(file: File): Result<StemAudioStats> {
+            return try {
+                if (!file.exists() || file.length() <= 44L) {
+                    return Result.failure(IllegalStateException("Stem WAV '${file.name}' does not exist or is empty"))
+                }
+                val header = WavStreamReader.tryReadHeader(file)
+                    ?: return Result.failure(IllegalStateException("Stem '${file.name}' has an invalid WAV header"))
+                if (header.dataSizeBytes <= 0L || header.channels <= 0 || header.sampleRate <= 0) {
+                    return Result.failure(IllegalStateException("Stem '${file.name}' contains zero audio data"))
+                }
+
+                val bytesPerSample = (header.bitsPerSample / 8).coerceAtLeast(2)
+                val frameCount = header.dataSizeBytes / (header.channels * bytesPerSample)
+                if (frameCount <= 0L) {
+                    return Result.failure(IllegalStateException("Stem '${file.name}' has zero frames"))
+                }
+
+                var sumSq = 0.0
+                var sampleCount = 0L
+                var peak = 0f
+
+                BufferedInputStream(FileInputStream(file), 64 * 1024).use { bis ->
+                    var skipped = 0L
+                    while (skipped < header.dataOffset) {
+                        val s = bis.skip(header.dataOffset - skipped)
+                        if (s <= 0L) break
+                        skipped += s
+                    }
+                    val buf = ByteArray(16 * 1024)
+                    var remaining = header.dataSizeBytes
+                    while (remaining > 0L) {
+                        val toRead = min(buf.size.toLong(), remaining).toInt()
+                        val read = bis.read(buf, 0, toRead)
+                        if (read <= 0) break
+                        remaining -= read
+                        if (header.audioFormat == 1 && header.bitsPerSample == 16) {
+                            val bb = ByteBuffer.wrap(buf, 0, read).order(ByteOrder.LITTLE_ENDIAN)
+                            while (bb.remaining() >= 2) {
+                                val s = bb.short / 32768.0f
+                                val a = abs(s)
+                                if (a > peak) peak = a
+                                sumSq += (s * s).toDouble()
+                                sampleCount++
+                            }
+                        } else if (header.audioFormat == 3 && header.bitsPerSample == 32) {
+                            val bb = ByteBuffer.wrap(buf, 0, read).order(ByteOrder.LITTLE_ENDIAN)
+                            while (bb.remaining() >= 4) {
+                                val s = bb.float
+                                if (s.isFinite()) {
+                                    val a = abs(s)
+                                    if (a > peak) peak = a
+                                    sumSq += (s * s).toDouble()
+                                }
+                                sampleCount++
+                            }
+                        }
+                    }
+                }
+
+                if (sampleCount == 0L) {
+                    return Result.failure(IllegalStateException("Stem '${file.name}' decoded 0 samples"))
+                }
+                val rms = sqrt(sumSq / sampleCount.toDouble()).toFloat().coerceAtLeast(1e-9f)
+                val rmsDbfs = (20.0 * log10(rms.toDouble())).toFloat()
+                val durationMs = (frameCount * 1000L) / header.sampleRate
+
+                Result.success(
+                    StemAudioStats(
+                        file = file,
+                        sampleRate = header.sampleRate,
+                        channels = header.channels,
+                        frameCount = frameCount,
+                        durationMs = durationMs,
+                        peakAmplitude = peak,
+                        rmsDbfs = rmsDbfs
+                    )
+                )
+            } catch (t: Throwable) {
+                Result.failure(t)
+            }
+        }
     }
 }

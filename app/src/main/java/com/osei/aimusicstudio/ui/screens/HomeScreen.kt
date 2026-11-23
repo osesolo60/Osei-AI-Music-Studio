@@ -134,6 +134,28 @@ fun HomeScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 ShortcutCard(
+                    title = "Vocal Separation",
+                    icon = Icons.Default.Mic,
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("home_vocal_separation_card"),
+                    onClick = { onNavigate("vocal_separation") }
+                )
+                ShortcutCard(
+                    title = "Song Analysis",
+                    icon = Icons.Default.GraphicEq,
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("home_song_analysis_card"),
+                    onClick = { onNavigate("song_analysis") }
+                )
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                ShortcutCard(
                     title = "Vocal Remover",
                     icon = Icons.Default.MicOff,
                     modifier = Modifier.weight(1f),

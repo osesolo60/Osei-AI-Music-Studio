@@ -8,6 +8,8 @@ sealed class Screen(val route: String) {
     object Profile : Screen("profile")
 
     object AudioImport : Screen("audio_import")
+    object VocalSeparation : Screen("vocal_separation")
+    object SongAnalysis : Screen("song_analysis")
     object VocalRemover : Screen("vocal_remover")
     object StemSeparator : Screen("stem_separator")
     object MusicAnalyzer : Screen("music_analyzer")
