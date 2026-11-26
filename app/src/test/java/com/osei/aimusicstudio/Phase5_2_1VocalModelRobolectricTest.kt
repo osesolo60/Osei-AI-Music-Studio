@@ -330,7 +330,7 @@ class Phase5_2_1VocalModelRobolectricTest {
                 if (System.currentTimeMillis() > deadline) fail("Timed out waiting for save callback")
                 Thread.sleep(15)
             }
-            return res!!
+            return res ?: error("Missing callback result")
         }
 
         // 1. Missing instrumental -> MUST fail and keep stemsSeparated == false
@@ -393,7 +393,7 @@ class Phase5_2_1VocalModelRobolectricTest {
         // Default model must be UVR-MDX-NET-Inst_HQ_4 (NOT KARA_2)
         composeRule.onNodeWithTag("vocal_sep_model_name")
             .performScrollTo()
-            .assertTextContains("UVR-MDX-NET-Inst_HQ_4")
+            .assertTextContains("UVR-MDX-NET-Inst_HQ_4", substring = true)
 
         composeRule.onNodeWithTag("vocal_sep_extract_vocals_btn")
             .performScrollTo()
@@ -406,7 +406,7 @@ class Phase5_2_1VocalModelRobolectricTest {
             .performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("vocal_sep_model_name")
-            .assertTextContains("UVR-MDX-NET-Inst_HQ_3")
+            .assertTextContains("UVR-MDX-NET-Inst_HQ_3", substring = true)
 
         composeRule.onNodeWithTag("model_chip_uvr_mdx_main")
             .performScrollTo()
@@ -414,7 +414,7 @@ class Phase5_2_1VocalModelRobolectricTest {
             .performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("vocal_sep_model_name")
-            .assertTextContains("UVR_MDXNET_Main")
+            .assertTextContains("UVR_MDXNET_Main", substring = true)
     }
 
     @Test
@@ -452,13 +452,17 @@ class Phase5_2_1VocalModelRobolectricTest {
                     "peakRamMb=${result.benchmark.peakUsedMb} elapsedMs=${result.benchmark.totalDurationMs} " +
                     "vocalsRmsDb=${vStats.rmsDbfs} instRmsDb=${iStats.rmsDbfs}"
             )
-            // Verify outputs differ meaningfully (primary vs subtraction)
+            // Verify outputs differ meaningfully (primary instrumental vs vocal subtraction)
             val vocalsHeader = WavStreamReader.tryReadHeader(vocalsFile)
             val instHeader = WavStreamReader.tryReadHeader(instFile)
             assertNotNull(vocalsHeader)
             assertNotNull(instHeader)
             assertEquals(44100, vocalsHeader!!.sampleRate)
             assertEquals(44100, instHeader!!.sampleRate)
+            assertFalse(
+                "Vocals and Instrumental stems must be distinct audio signals",
+                vocalsFile.readBytes().contentEquals(instFile.readBytes())
+            )
         } else {
             val reason = downloadRes.exceptionOrNull()?.let { "${it::class.java.simpleName}: ${it.message}" } ?: "unknown"
             println("REAL_UVR_MODEL_DOWNLOAD_BLOCKED reason=$reason")

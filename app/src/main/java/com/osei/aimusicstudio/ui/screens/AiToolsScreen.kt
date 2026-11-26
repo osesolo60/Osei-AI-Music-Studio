@@ -92,7 +92,7 @@ fun AiToolsScreen(onNavigate: (String) -> Unit) {
         item {
             AiToolItemCard(
                 title = "AI Music Generator",
-                description = "Create original royalty-free tracks using generative text prompts.",
+                description = "Currently unavailable on GH₵0 / 4 GB RAM target (requires paid music API or >4 GB RAM). Tap for details.",
                 icon = Icons.Default.AutoAwesome,
                 onClick = { onNavigate("ai_music_generator") }
             )

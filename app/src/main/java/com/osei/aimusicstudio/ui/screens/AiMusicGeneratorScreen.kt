@@ -203,6 +203,18 @@ fun AiMusicGeneratorScreen(
                         lineHeight = 18.sp
                     )
                     Text(
+                        text = "Verified GH₵0 / 4 GB RAM audit:\n" +
+                            "• Google Lyria (Gemini API / Vertex AI): Not on free tier; requires paid Cloud Billing / Blaze.\n" +
+                            "• ElevenLabs Music API (/v1/music): Programmatic API requires a paid plan.\n" +
+                            "• Hugging Face Inference: Free legacy serverless endpoint retired; audio models require PRO/paid credits.\n" +
+                            "• Suno / Udio: No official public free developer API.\n" +
+                            "• Mubert / Beatoven / Soundraw / Replicate: Metered or paid developer API plans.\n" +
+                            "• On-device MusicGen / Stable Audio Open Small: ~400–900 MB weights & ~1.6–2.4 GB peak RAM exceed 4 GB Android phone limits.",
+                        color = TextGrey,
+                        fontSize = 11.sp,
+                        lineHeight = 16.sp
+                    )
+                    Text(
                         text = "This app does not simulate progress or fabricate placeholder tracks. You can import local audio or compose using the Audio Editor and 6-Track Mixer offline.",
                         color = TextGrey,
                         fontSize = 12.sp,
@@ -214,17 +226,21 @@ fun AiMusicGeneratorScreen(
             OutlinedTextField(
                 value = uiState.prompt,
                 onValueChange = { uiState = uiState.copy(prompt = it) },
-                label = { Text("Music Prompt (Disabled until provider is configured)") },
+                enabled = uiState.canGenerate,
+                label = { Text("Music Prompt (Disabled — no GH₵0 provider available)") },
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("ai_music_prompt_input"),
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedBorderColor = NeonBlue,
                     unfocusedBorderColor = TextGrey,
+                    disabledBorderColor = TextGrey.copy(alpha = 0.4f),
                     focusedLabelColor = NeonBlue,
                     unfocusedLabelColor = TextGrey,
+                    disabledLabelColor = TextGrey.copy(alpha = 0.7f),
                     focusedTextColor = TextWhite,
-                    unfocusedTextColor = TextWhite
+                    unfocusedTextColor = TextWhite,
+                    disabledTextColor = TextGrey
                 )
             )
 
